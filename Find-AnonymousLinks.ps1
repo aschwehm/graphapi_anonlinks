@@ -142,7 +142,7 @@ function Test-AnonymousLink {
         # Additional suspicious patterns
         "embedded=true",
         "nav=eyJ",  # Base64 encoded navigation (often in sharing)
-        "cid=[a-fA-F0-9]{8,}",  # Correlation IDs in sharing URLs
+        "cid=[a-fA-F0-9]{8,}"  # Correlation IDs in sharing URLs
     )
     
     foreach ($pattern in $anonymousPatterns) {
@@ -284,7 +284,6 @@ function Test-ItemSharingPermissions {
     }
     
     return $sharingInfo
-}
 }
 
 # Function to scan a SharePoint site for anonymous links
@@ -646,9 +645,9 @@ try {
         $siteStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         
         # Handle different site object types and property names
-        $siteName = $site.DisplayName ?? $site.displayName ?? $site.Name ?? $site.name ?? "Unknown Site"
-        $siteUrl = $site.WebUrl ?? $site.webUrl ?? $site.Url ?? $site.url ?? ""
-        $siteId = $site.Id ?? $site.id ?? ""
+        $siteName = if ($site.DisplayName) { $site.DisplayName } elseif ($site.displayName) { $site.displayName } elseif ($site.Name) { $site.Name } elseif ($site.name) { $site.name } else { "Unknown Site" }
+        $siteUrl = if ($site.WebUrl) { $site.WebUrl } elseif ($site.webUrl) { $site.webUrl } elseif ($site.Url) { $site.Url } elseif ($site.url) { $site.url } else { "" }
+        $siteId = if ($site.Id) { $site.Id } elseif ($site.id) { $site.id } else { "" }
         
         # Enhanced progress display
         $percentComplete = ($siteCount / $sites.Count) * 100
