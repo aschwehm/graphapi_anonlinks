@@ -2,6 +2,18 @@
 
 A PowerShell script that scans Microsoft 365 SharePoint sites for pages and documents containing anonymous access links.
 
+**Version 2.0** - Universal compatibility with Windows 10 and Windows 11.
+
+## Features
+
+- ✅ **Universal Compatibility**: Works reliably on both Windows 10 and Windows 11
+- ✅ **No Hanging Issues**: Optimized site discovery that won't get stuck
+- ✅ **Comprehensive Detection**: 50+ patterns for detecting anonymous/guest sharing
+- ✅ **Direct Permission Checking**: Scans actual file/folder sharing permissions
+- ✅ **Performance Optimized**: Limits scanning to prevent timeouts
+- ✅ **Clear Output**: Timestamped progress with safe color handling
+- ✅ **Detailed Reporting**: CSV export with categorized findings
+
 ## Prerequisites
 
 ### Required PowerShell Modules
@@ -55,25 +67,43 @@ The script uses **modern authentication** with an interactive popup window. When
 ## What the Script Does
 
 1. **Connects** to Microsoft Graph using modern authentication
-2. **Retrieves** all SharePoint sites in your tenant
+2. **Discovers** SharePoint sites using reliable methods (optimized for Windows 10/11)
 3. **Scans** each site for:
-   - Site pages content
-   - Document libraries
-   - Embedded links and URLs
-4. **Identifies** potential anonymous access links using pattern matching
-5. **Reports** findings with detailed information
-6. **Exports** results to a CSV file
+   - Document libraries and files
+   - Direct sharing permissions on items
+   - Anonymous access patterns in URLs
+4. **Identifies** potential anonymous access using:
+   - SharePoint sharing link patterns (`:x:/`, `:b:/`, `:f:/`, etc.)
+   - OneDrive sharing detection (`1drv.ms`, etc.)
+   - Guest user permissions (`#EXT#` users)
+   - Anonymous link types and scopes
+5. **Reports** findings with detailed categorization
+6. **Exports** results to a timestamped CSV file
 
-## Anonymous Link Patterns Detected
+## Anonymous Link Detection
 
-The script looks for common patterns that indicate anonymous or guest access:
+The script detects various types of anonymous or guest access including:
 
-- `guestaccess=true`
-- `anonymous`, `guest`, `anyone`, `public`
-- SharePoint sharing link patterns (`:x:/`, `:b:/`, `:f:/`)
+### URL Patterns
+- SharePoint sharing links (`:x:/`, `:b:/`, `:f:/`, `:p:/`, `:w:/`, `:u:/`, `:v:/`, `:i:`)
 - OneDrive short links (`1drv.ms`)
-- Microsoft short links (`aka.ms`)
-- Generic SharePoint sharing URLs
+- Guest access parameters (`guestaccess=true`, `anonymous`, `guest`, `anyone`)
+- Sharing-related URLs (`authkey=`, `resid=`, `embedded=true`)
+- Forms and other Office 365 sharing patterns
+
+### Permission Analysis
+- Anonymous sharing link permissions
+- Guest user access (external users with `#EXT#` in email)
+- "Anyone with link" permissions
+- Organization-wide sharing links
+
+## Performance & Compatibility
+
+- **Windows 10 Compatible**: Uses reliable site discovery methods that don't hang
+- **Windows 11 Optimized**: Takes advantage of newer features when available
+- **Performance Limited**: Scans up to 50 items per drive to prevent timeouts
+- **Safe Output**: Handles console color compatibility across Windows versions
+- **Error Resilient**: Continues scanning even if individual sites fail
 
 ## Output
 
@@ -103,34 +133,52 @@ The CSV contains:
 ## Example Output
 
 ```
-SharePoint Anonymous Links Scanner
-=================================
-Connecting to Microsoft Graph...
-Successfully connected to Microsoft Graph!
-Tenant ID: 12345678-1234-1234-1234-123456789012
-Account: admin@yourcompany.com
+[14:30:15] SharePoint Anonymous Links Scanner v2.0
+[14:30:15] ========================================
+[14:30:15] Compatible with Windows 10 and 11
+[14:30:16] SUCCESS: All required modules found
+[14:30:17] Connecting to Microsoft Graph...
+[14:30:20] SUCCESS: Connected to tenant: fa695a3c-5803-4949-bcd1-0eada87cafb4
+[14:30:20] Account: admin@yourcompany.com
+[14:30:21] SUCCESS: Found 25 sites via search
+[14:30:22] Starting site-by-site scan...
+[14:30:22] ==============================
+[14:30:22] PROGRESS: [1/25] Scanning: Human Resources
+[14:30:22] URL: https://yourcompany.sharepoint.com/sites/hr
+[14:30:23] SUCCESS: Result: No anonymous links found
+[14:30:23] Scan time: 1.23s
+[14:30:25] PROGRESS: [2/25] Scanning: Marketing Team
+[14:30:25] URL: https://yourcompany.sharepoint.com/sites/marketing
+[14:30:25] PROGRESS:   Checking drive: Documents
+[14:30:26] WARNING:     FOUND: Anonymous pattern in SharedPresentation.pptx
+[14:30:26] WARNING:     FOUND: Guest user access: external@partner.com#EXT# in ProjectPlan.xlsx
+[14:30:27] WARNING: Result: FOUND 2 anonymous link(s)
+[14:30:27] Scan time: 2.15s
 
-Retrieving SharePoint sites...
-Found 25 SharePoint sites
-Scanning site: Human Resources
-Scanning site: Marketing
-WARNING: Found 2 anonymous link(s) in page: Welcome.aspx
-Scanning site: Sales
+...
 
-SCAN COMPLETE
-=============
-Found anonymous links in 1 location(s):
+[14:35:30] SCAN COMPLETE
+[14:35:30] =============
+[14:35:30] Total sites scanned: 25
+[14:35:30] Sites with anonymous links: 3
+[14:35:30] Total anonymous links found: 8
 
-Site: Marketing
-Page: Welcome.aspx
-URL: https://yourcompany.sharepoint.com/sites/marketing/SitePages/Welcome.aspx
-Anonymous Links Found: 2
-  - https://yourcompany-my.sharepoint.com/:x:/g/personal/user_yourcompany_com/document123
-  - https://1drv.ms/w/s!AbcDefGhiJklMnop
+[14:35:30] WARNING: ANONYMOUS LINKS FOUND:
 
-Results exported to: AnonymousLinks_20250811_143022.csv
+[14:35:30] Site: Marketing Team
+[14:35:30] Item: SharedPresentation.pptx
+[14:35:30] Location: Documents
+[14:35:30] Finding: Anonymous pattern in URL
+[14:35:30] URL: https://yourcompany-my.sharepoint.com/:p:/g/personal/user_yourcompany_com/doc123
 
-Script completed!
+[14:35:30] Site: Marketing Team
+[14:35:30] Item: ProjectPlan.xlsx
+[14:35:30] Location: Documents
+[14:35:30] Finding: Guest user access: external@partner.com#EXT#
+[14:35:30] URL: https://yourcompany.sharepoint.com/sites/marketing/Documents/ProjectPlan.xlsx
+
+[14:35:30] SUCCESS: Results exported to: AnonymousLinks_20250811_143530.csv
+[14:35:30] Script completed
 ```
 
 ## Troubleshooting
