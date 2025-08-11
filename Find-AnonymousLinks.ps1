@@ -27,6 +27,7 @@
     Author: Generated Script
     Requires: Microsoft.Graph PowerShell SDK
     Version: 1.0
+    Compatible: Windows 10/11 PowerShell 5.1+
 #>
 
 [CmdletBinding()]
@@ -41,6 +42,57 @@ param(
         "User.Read"
     )
 )
+
+# Windows 10 compatibility fixes
+$ErrorActionPreference = "Continue"
+$ProgressPreference = "Continue"
+
+# Fix console encoding issues on Windows 10
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::InputEncoding = [System.Text.Encoding]::UTF8
+} catch {
+    # Ignore encoding errors on older systems
+}
+
+# Disable problematic features on older Windows versions
+$isWindows10 = [Environment]::OSVersion.Version.Major -eq 10 -and [Environment]::OSVersion.Version.Build -lt 22000
+if ($isWindows10) {
+    $PSStyle = $null  # Disable PSStyle on Windows 10
+}
+
+# Windows 10 compatibility: Safe colored output function
+function Write-HostSafe {
+    param(
+        [string]$Object,
+        [string]$ForegroundColor = "White",
+        [string]$BackgroundColor,
+        [switch]$NoNewline
+    )
+    
+    try {
+        $writeHostParams = @{
+            Object = $Object
+        }
+        
+        if ($ForegroundColor -and $ForegroundColor -ne "White") {
+            $writeHostParams.ForegroundColor = $ForegroundColor
+        }
+        
+        if ($BackgroundColor) {
+            $writeHostParams.BackgroundColor = $BackgroundColor
+        }
+        
+        if ($NoNewline) {
+            $writeHostParams.NoNewline = $true
+        }
+        
+        Write-Host @writeHostParams
+    } catch {
+        # Fallback to plain text on Windows 10 compatibility issues
+        Write-Output $Object
+    }
+}
 
 # Function to check if required modules are installed
 function Test-RequiredModules {
@@ -454,13 +506,13 @@ function Search-SiteForAnonymousLinks {
 }
 
 # Main script execution
-Write-Host "SharePoint Anonymous Links Scanner" -ForegroundColor Green
-Write-Host "=================================" -ForegroundColor Green
-Write-Host "Start time: $(Get-Date)" -ForegroundColor Gray
-Write-Host ""
+Write-HostSafe "SharePoint Anonymous Links Scanner" -ForegroundColor Green
+Write-HostSafe "=================================" -ForegroundColor Green
+Write-HostSafe "Start time: $(Get-Date)" -ForegroundColor Gray
+Write-HostSafe ""
 
 # Check for required modules
-Write-Host "Checking required modules..." -ForegroundColor Yellow
+Write-HostSafe "Checking required modules..." -ForegroundColor Yellow
 if (!(Test-RequiredModules)) {
     Write-Host "Required modules are missing. Please run Setup.ps1 first." -ForegroundColor Red
     exit 1
@@ -506,26 +558,40 @@ try {
     
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     
-    # Try multiple methods to get SharePoint sites
+    # Use a more reliable method that works on both Windows 10 and 11
     $sites = @()
     
     try {
-        Write-Host "Method 1: Attempting to get all sites directly..." -ForegroundColor Gray
-        $sites = Get-MgSite -All -ErrorAction SilentlyContinue
-        Write-Host "Direct method found $($sites.Count) sites" -ForegroundColor Gray
+        Write-HostSafe "Searching for SharePoint sites..." -ForegroundColor Gray
+        
+        # Use search method first as it's more reliable on Windows 10
+        $searchResults = Get-MgSite -Search "*" -All -ErrorAction Stop
+        $sites += $searchResults
+        Write-HostSafe "Search method found $($sites.Count) sites" -ForegroundColor Gray
+        
     } catch {
-        Write-Host "Direct method failed: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-    
-    # If no sites found, try getting sites by search
-    if ($sites.Count -eq 0) {
+        Write-HostSafe "Search method failed, trying direct API..." -ForegroundColor Yellow
+        
+        # Fallback to direct Graph API if search fails
         try {
-            Write-Host "Method 2: Searching for SharePoint sites..." -ForegroundColor Gray
-            $searchResults = Get-MgSite -Search "*" -All -ErrorAction SilentlyContinue
-            $sites += $searchResults
-            Write-Host "Search method found $($sites.Count) additional sites" -ForegroundColor Gray
+            $graphResponse = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/sites?search=*" -Method GET
+            if ($graphResponse.value) {
+                $sites = $graphResponse.value
+                Write-HostSafe "Direct API found $($sites.Count) sites" -ForegroundColor Gray
+            }
         } catch {
-            Write-Host "Search method failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-HostSafe "Direct API also failed, trying root site method..." -ForegroundColor Yellow
+            
+            # Last resort: try to get root site
+            try {
+                $rootSiteResponse = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/sites/root" -Method GET -ErrorAction SilentlyContinue
+                if ($rootSiteResponse) {
+                    $sites += $rootSiteResponse
+                    Write-HostSafe "Found root site: $($rootSiteResponse.displayName)" -ForegroundColor Gray
+                }
+            } catch {
+                Write-HostSafe "Root site method also failed" -ForegroundColor Yellow
+            }
         }
     }
     
