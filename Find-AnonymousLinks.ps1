@@ -620,24 +620,7 @@ try {
     Write-Host ""
     Write-Host "Site Summary:" -ForegroundColor Cyan
     Write-Host "============" -ForegroundColor Cyan
-    
-    # Show first few sites for debugging
-    Write-Host "Sample sites found:" -ForegroundColor Gray
-    for ($i = 0; $i -lt [Math]::Min(3, $sites.Count); $i++) {
-        $site = $sites[$i]
-        $siteName = $site.DisplayName ?? $site.displayName ?? $site.Name ?? $site.name ?? "Unknown"
-        $siteUrl = $site.WebUrl ?? $site.webUrl ?? $site.Url ?? $site.url ?? "Unknown"
-        Write-Host "  [$($i+1)] $siteName - $siteUrl" -ForegroundColor Gray
-    }
-    
-    if ($sites.Count -gt 3) {
-        Write-Host "  ... and $($sites.Count - 3) more sites" -ForegroundColor Gray
-    }
-    
-    # Group by template if available
-    $siteTypes = $sites | Group-Object -Property { $_.Template ?? $_.template ?? "Unknown" } | Sort-Object Count -Descending
-    Write-Host ""
-    Write-Host "Site types:" -ForegroundColor Gray
+    $siteTypes = $sites | Group-Object -Property Template | Sort-Object Count -Descending
     foreach ($type in $siteTypes) {
         if ($type.Name) {
             Write-Host "  $($type.Name): $($type.Count) sites" -ForegroundColor Gray
