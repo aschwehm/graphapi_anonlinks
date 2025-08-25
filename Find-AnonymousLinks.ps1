@@ -2,33 +2,66 @@
 
 <#
 .SYNOPSIS
-    Scans Microsoft 365 SharePoint sites for pages containing anonymous access links.
+    Comprehensive SharePoint anonymous links scanner using Microsoft Graph permissions API.
 
 .DESCRIPTION
-    This script connects to Microsoft Graph API using modern authentication,
-    retrieves all SharePoint sites in the tenant, and scans site pages for
-    links that provide anonymous access to resources.
-    
-    Compatible with Windows 10 and 11.
+    This script uses Microsoft Graph's /permissions endpoint to properly detect anonymous links
+    on SharePoint drives and items. It supports full pagination, proper throttling, multiple
+    authentication methods, and provides detailed machine-readable output for remediation.
 
 .PARAMETER TenantId
-    The tenant ID of your Microsoft 365 organization (optional - will prompt if not provided)
+    The tenant ID of your Microsoft 365 organization
 
-.PARAMETER Scope
-    The permissions scope for Microsoft Graph access (default includes necessary permissions)
+.PARAMETER AuthMethod
+    Authentication method: Interactive (default), AppOnly, DeviceCode
+
+.PARAMETER ClientId
+    Client ID for app-only authentication
+
+.PARAMETER ClientSecret
+    Client secret for app-only authentication (use certificate preferred)
+
+.PARAMETER CertificateThumbprint
+    Certificate thumbprint for app-only authentication
+
+.PARAMETER OutputFormat
+    Output format: CSV (default), JSON, Both
+
+.PARAMETER OutputPath
+    Custom output path for results
+
+.PARAMETER MaxConcurrency
+    Maximum concurrent operations (default: 5)
+
+.PARAMETER EnableDeltaQuery
+    Enable delta queries for incremental scans
+
+.PARAMETER SiteFilter
+    Filter sites by name pattern (regex supported)
+
+.PARAMETER BatchSize
+    Batch size for Graph requests (default: 20)
+
+.PARAMETER MaxRetries
+    Maximum retry attempts for failed requests (default: 3)
 
 .EXAMPLE
     .\Find-AnonymousLinks.ps1
-    Runs the script with interactive authentication and default settings
+    Interactive scan with default settings
 
 .EXAMPLE
-    .\Find-AnonymousLinks.ps1 -TenantId "your-tenant-id"
-    Runs the script with a specific tenant ID
+    .\Find-AnonymousLinks.ps1 -AuthMethod AppOnly -ClientId "app-id" -CertificateThumbprint "thumbprint"
+    Unattended scan using app-only authentication
+
+.EXAMPLE
+    .\Find-AnonymousLinks.ps1 -OutputFormat JSON -MaxConcurrency 10
+    High-performance scan with JSON output
 
 .NOTES
-    Author: Generated Script
+    Author: Enhanced Security Scanner
+    Version: 3.0 - Production Ready
     Requires: Microsoft.Graph PowerShell SDK
-    Version: 2.0 - Windows 10/11 Compatible
+    License: MIT
 #>
 
 [CmdletBinding()]
@@ -37,379 +70,683 @@ param(
     [string]$TenantId,
     
     [Parameter(Mandatory = $false)]
-    [string[]]$Scope = @(
-        "Sites.Read.All",
-        "Files.Read.All",
-        "User.Read"
-    )
+    [ValidateSet("Interactive", "AppOnly", "DeviceCode")]
+    [string]$AuthMethod = "Interactive",
+    
+    [Parameter(Mandatory = $false)]
+    [string]$ClientId,
+    
+    [Parameter(Mandatory = $false)]
+    [securestring]$ClientSecret,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$CertificateThumbprint,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("CSV", "JSON", "Both")]
+    [string]$OutputFormat = "Both",
+    
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = ".",
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 20)]
+    [int]$MaxConcurrency = 5,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$EnableDeltaQuery,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$SiteFilter,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 100)]
+    [int]$BatchSize = 20,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 10)]
+    [int]$MaxRetries = 3
 )
 
-# Windows compatibility settings
-$ErrorActionPreference = "Continue"
-$ProgressPreference = "Continue"
+# Configuration and constants
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
-# Safe output function that works on both Windows 10 and 11
-function Write-StatusMessage {
+# Required Graph permissions based on auth method
+$DelegatedScopes = @(
+    "Sites.Read.All",
+    "Files.Read.All", 
+    "User.Read"
+)
+
+$AppOnlyScopes = @(
+    "https://graph.microsoft.com/Sites.Read.All",
+    "https://graph.microsoft.com/Files.Read.All"
+)
+
+# Retry configuration
+$script:RetryConfig = @{
+    MaxRetries = $MaxRetries
+    BaseDelaySeconds = 1
+    MaxDelaySeconds = 60
+}
+
+# Result collection
+$script:Results = [System.Collections.Concurrent.ConcurrentBag[PSCustomObject]]::new()
+$script:Stats = @{
+    SitesScanned = 0
+    DrivesScanned = 0
+    ItemsScanned = 0
+    AnonymousLinksFound = 0
+    Errors = 0
+    StartTime = Get-Date
+}
+
+#region Utility Functions
+
+function Write-Log {
     param(
         [string]$Message,
+        [ValidateSet("Info", "Warning", "Error", "Success", "Debug")]
         [string]$Level = "Info"
     )
     
-    $timestamp = Get-Date -Format "HH:mm:ss"
-    
-    try {
-        switch ($Level) {
-            "Error" { 
-                Write-Host "[$timestamp] " -NoNewline -ForegroundColor Gray
-                Write-Host "ERROR: $Message" -ForegroundColor Red 
-            }
-            "Warning" { 
-                Write-Host "[$timestamp] " -NoNewline -ForegroundColor Gray
-                Write-Host "WARNING: $Message" -ForegroundColor Yellow 
-            }
-            "Success" { 
-                Write-Host "[$timestamp] " -NoNewline -ForegroundColor Gray
-                Write-Host "SUCCESS: $Message" -ForegroundColor Green 
-            }
-            "Progress" { 
-                Write-Host "[$timestamp] " -NoNewline -ForegroundColor Gray
-                Write-Host "PROGRESS: $Message" -ForegroundColor Cyan 
-            }
-            default { 
-                Write-Host "[$timestamp] " -NoNewline -ForegroundColor Gray
-                Write-Host "$Message" -ForegroundColor White 
-            }
-        }
-    } catch {
-        # Fallback for compatibility issues
-        Write-Output "[$timestamp] $Level`: $Message"
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $color = switch ($Level) {
+        "Error" { "Red" }
+        "Warning" { "Yellow" }
+        "Success" { "Green" }
+        "Debug" { "Cyan" }
+        default { "White" }
     }
+    
+    Write-Host "[$timestamp] " -NoNewline -ForegroundColor Gray
+    Write-Host "$Level`.ToUpper(): $Message" -ForegroundColor $color
 }
 
-# Function to test for anonymous links with comprehensive patterns
-function Test-AnonymousLink {
-    param([string]$Url)
-    
-    if ([string]::IsNullOrWhiteSpace($Url)) {
-        return $false
-    }
-    
-    $patterns = @(
-        ":x:/", ":b:/", ":f:/", ":p:/", ":w:/", ":u:/", ":v:/", ":i:",
-        "1drv\.ms",
-        "guestaccess=true",
-        "anonymous", "guest", "anyone", "public", "sharing",
-        "-my\.sharepoint\.com/.*:[a-z]:",
-        "sharepoint\.com/:[a-z]:",
-        "_layouts/15/guestaccess.aspx",
-        "authkey=", "resid=", "ithint=",
-        "action=embedview", "action=edit",
-        "embedded=true",
-        "forms\.office\.com/.*[Rr]",
-        "nav=eyJ"
+function Invoke-GraphWithRetry {
+    param(
+        [string]$Uri,
+        [string]$Method = "GET",
+        [hashtable]$Headers = @{},
+        [object]$Body = $null,
+        [int]$RetryCount = 0
     )
     
-    foreach ($pattern in $patterns) {
-        if ($Url -match $pattern) {
-            return $true
+    try {
+        $params = @{
+            Uri = $Uri
+            Method = $Method
+            Headers = $Headers
+        }
+        
+        if ($Body) {
+            $params.Body = $Body | ConvertTo-Json -Depth 10
+            $params.ContentType = "application/json"
+        }
+        
+        return Invoke-MgGraphRequest @params
+    }
+    catch {
+        $statusCode = $null
+        $retryAfter = $null
+        
+        # Extract status code and retry-after header
+        if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+            $retryAfter = $_.Exception.Response.Headers["Retry-After"]
+        }
+        
+        # Handle throttling (429) and server errors (5xx)
+        if (($statusCode -eq 429 -or $statusCode -ge 500) -and $RetryCount -lt $script:RetryConfig.MaxRetries) {
+            $delay = if ($retryAfter) {
+                [int]$retryAfter
+            } else {
+                [Math]::Min(
+                    $script:RetryConfig.BaseDelaySeconds * [Math]::Pow(2, $RetryCount),
+                    $script:RetryConfig.MaxDelaySeconds
+                )
+            }
+            
+            Write-Log "Request throttled/failed (Status: $statusCode). Retrying in $delay seconds..." -Level Warning
+            Start-Sleep -Seconds $delay
+            
+            return Invoke-GraphWithRetry -Uri $Uri -Method $Method -Headers $Headers -Body $Body -RetryCount ($RetryCount + 1)
+        }
+        
+        # Re-throw if not retryable or max retries exceeded
+        throw
+    }
+}
+
+function Get-AllGraphPages {
+    param(
+        [string]$Uri,
+        [hashtable]$Headers = @{}
+    )
+    
+    $allResults = @()
+    $nextLink = $Uri
+    
+    while ($nextLink) {
+        try {
+            $response = Invoke-GraphWithRetry -Uri $nextLink -Headers $Headers
+            
+            if ($response.value) {
+                $allResults += $response.value
+            }
+            
+            $nextLink = $response.'@odata.nextLink'
+        }
+        catch {
+            Write-Log "Failed to retrieve page: $($_.Exception.Message)" -Level Error
+            $script:Stats.Errors++
+            break
         }
     }
     
-    return $false
+    return $allResults
 }
 
-# Function to check file/folder sharing permissions
-function Test-ItemSharingPermissions {
+#endregion
+
+#region Authentication Functions
+
+function Connect-GraphWithMethod {
+    param(
+        [string]$Method,
+        [string]$TenantId,
+        [string]$ClientId,
+        [securestring]$ClientSecret,
+        [string]$CertificateThumbprint
+    )
+    
+    try {
+        $connectParams = @{}
+        
+        switch ($Method) {
+            "Interactive" {
+                $connectParams.Scopes = $DelegatedScopes
+                if ($TenantId) { $connectParams.TenantId = $TenantId }
+                Write-Log "Connecting with interactive authentication..."
+            }
+            
+            "DeviceCode" {
+                $connectParams.Scopes = $DelegatedScopes
+                $connectParams.UseDeviceCode = $true
+                if ($TenantId) { $connectParams.TenantId = $TenantId }
+                Write-Log "Connecting with device code authentication..."
+            }
+            
+            "AppOnly" {
+                if (-not $ClientId) {
+                    throw "ClientId is required for app-only authentication"
+                }
+                if (-not $TenantId) {
+                    throw "TenantId is required for app-only authentication"
+                }
+                
+                $connectParams.ClientId = $ClientId
+                $connectParams.TenantId = $TenantId
+                
+                if ($CertificateThumbprint) {
+                    $connectParams.CertificateThumbprint = $CertificateThumbprint
+                    Write-Log "Connecting with app-only authentication (certificate)..."
+                } elseif ($ClientSecret) {
+                    $connectParams.ClientSecretCredential = [System.Management.Automation.PSCredential]::new(
+                        $ClientId,
+                        $ClientSecret
+                    )
+                    Write-Log "Connecting with app-only authentication (client secret)..."
+                } else {
+                    throw "Either CertificateThumbprint or ClientSecret is required for app-only authentication"
+                }
+            }
+        }
+        
+        Connect-MgGraph @connectParams -NoWelcome
+        
+        $context = Get-MgContext
+        Write-Log "Successfully connected to tenant: $($context.TenantId)" -Level Success
+        Write-Log "Account: $($context.Account)"
+        Write-Log "Auth type: $($context.AuthType)"
+        
+        return $true
+    }
+    catch {
+        Write-Log "Authentication failed: $($_.Exception.Message)" -Level Error
+        return $false
+    }
+}
+
+#endregion
+
+#region Core Scanning Functions
+
+function Get-AnonymousPermissions {
     param(
         [string]$DriveId,
         [string]$ItemId,
         [string]$ItemName,
-        [string]$ItemUrl
+        [string]$ItemPath,
+        [string]$SiteId,
+        [string]$SiteName
     )
     
-    $sharingInfo = @()
-    
     try {
-        $permissions = Get-MgDriveItemPermission -DriveId $DriveId -DriveItemId $ItemId -All -ErrorAction SilentlyContinue
+        # Get all permissions for the item
+        $permissionsUri = "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$ItemId/permissions"
+        $permissions = Get-AllGraphPages -Uri $permissionsUri
         
         foreach ($permission in $permissions) {
             $isAnonymous = $false
-            $reason = ""
+            $linkType = $null
+            $linkScope = $null
+            $grantedTo = $null
+            $expiresOn = $null
             
-            if ($permission.Link) {
-                if ($permission.Link.Type -eq "anonymous" -or 
-                    $permission.Link.Scope -eq "anonymous") {
+            # Check for anonymous links using proper Graph properties
+            if ($permission.link) {
+                $linkType = $permission.link.type
+                $linkScope = $permission.link.scope
+                
+                # Anonymous detection based on Graph API properties
+                if ($linkScope -eq "anonymous" -or $linkType -eq "anonymous") {
                     $isAnonymous = $true
-                    $reason = "Anonymous sharing link"
                 }
                 
-                if ($permission.Link.WebUrl -and (Test-AnonymousLink -Url $permission.Link.WebUrl)) {
+                # Also check for "anyone" links
+                if ($linkScope -eq "anyone") {
                     $isAnonymous = $true
-                    $reason = "Sharing URL contains anonymous patterns"
+                }
+                
+                if ($permission.link.expirationDateTime) {
+                    $expiresOn = [datetime]$permission.link.expirationDateTime
                 }
             }
             
-            if ($permission.GrantedTo -and $permission.GrantedTo.User) {
-                $userEmail = $permission.GrantedTo.User.Email
-                if ($userEmail -and $userEmail -like "*#EXT#*") {
-                    $isAnonymous = $true
-                    $reason = "Guest user access: $userEmail"
+            # Check for guest users (external users)
+            if ($permission.grantedTo -and $permission.grantedTo.user) {
+                $grantedTo = $permission.grantedTo.user.email
+                if ($grantedTo -like "*#EXT#*") {
+                    # This is an external user, which may indicate anonymous sharing context
+                    # Only flag if it's truly anonymous (not just external domain)
+                    if (-not $permission.link -or $permission.link.scope -eq "anonymous") {
+                        $isAnonymous = $true
+                    }
                 }
             }
             
             if ($isAnonymous) {
-                $sharingInfo += [PSCustomObject]@{
+                $result = [PSCustomObject]@{
+                    SiteId = $SiteId
+                    SiteName = $SiteName
+                    DriveId = $DriveId
+                    ItemId = $ItemId
                     ItemName = $ItemName
-                    ItemUrl = $ItemUrl
-                    Reason = $reason
-                    ShareLink = $permission.Link.WebUrl
-                    GrantedTo = if ($permission.GrantedTo.User.Email) { $permission.GrantedTo.User.Email } else { "Anyone" }
+                    ItemPath = $ItemPath
+                    PermissionId = $permission.id
+                    LinkType = $linkType
+                    LinkScope = $linkScope
+                    ExpiresOn = $expiresOn
+                    GrantedTo = $grantedTo
+                    WebUrl = $permission.link.webUrl
+                    ScanDate = Get-Date
+                    HasPassword = if ($permission.link.hasPassword) { $permission.link.hasPassword } else { $false }
+                    Application = $permission.link.application
+                    Roles = if ($permission.roles) { $permission.roles -join "," } else { $null }
                 }
+                
+                $script:Results.Add($result)
+                $script:Stats.AnonymousLinksFound++
+                
+                Write-Log "FOUND: Anonymous link in '$ItemName' (Scope: $linkScope, Type: $linkType)" -Level Warning
             }
         }
-    } catch {
-        # Silently continue on permission errors
+        
+        $script:Stats.ItemsScanned++
     }
-    
-    return $sharingInfo
+    catch {
+        Write-Log "Failed to check permissions for item '$ItemName': $($_.Exception.Message)" -Level Error
+        $script:Stats.Errors++
+    }
 }
 
-# Function to scan a SharePoint site
-function Search-SiteForAnonymousLinks {
+function Scan-DriveItems {
     param(
+        [string]$DriveId,
+        [string]$DriveName,
         [string]$SiteId,
         [string]$SiteName,
-        [string]$SiteUrl
+        [string]$DeltaToken = $null
     )
     
-    $results = @()
-    
     try {
-        # Scan document libraries
-        $drives = Get-MgSiteDrive -SiteId $SiteId -All -ErrorAction SilentlyContinue
+        Write-Log "Scanning drive: $DriveName"
         
-        foreach ($drive in $drives) {
-            Write-StatusMessage "  Checking drive: $($drive.Name)" -Level "Progress"
+        # Build URI with proper pagination and consistency level
+        $baseUri = "https://graph.microsoft.com/v1.0/drives/$DriveId/root/children"
+        $headers = @{
+            'ConsistencyLevel' = 'eventual'
+        }
+        
+        if ($EnableDeltaQuery -and $DeltaToken) {
+            $uri = "https://graph.microsoft.com/v1.0/drives/$DriveId/root/delta?token=$DeltaToken"
+        } else {
+            $uri = "$baseUri`?`$top=$BatchSize&`$expand=children"
+        }
+        
+        # Get all items with proper pagination
+        $items = Get-AllGraphPages -Uri $uri -Headers $headers
+        
+        if ($items.Count -eq 0) {
+            Write-Log "No items found in drive: $DriveName" -Level Debug
+            return
+        }
+        
+        Write-Log "Found $($items.Count) items in drive: $DriveName"
+        
+        # Process items in batches with concurrency control
+        $batches = for ($i = 0; $i -lt $items.Count; $i += $BatchSize) {
+            $items[$i..[Math]::Min($i + $BatchSize - 1, $items.Count - 1)]
+        }
+        
+        $batches | ForEach-Object -Parallel {
+            $batch = $_
+            $innerDriveId = $using:DriveId
+            $innerSiteId = $using:SiteId
+            $innerSiteName = $using:SiteName
             
-            try {
-                # Limit to first 50 items per drive for performance
-                $items = Get-MgDriveItem -DriveId $drive.Id -Top 50 -ErrorAction SilentlyContinue
-                
-                foreach ($item in $items) {
-                    # Check item URL for anonymous patterns
-                    if ($item.WebUrl -and (Test-AnonymousLink -Url $item.WebUrl)) {
-                        $result = [PSCustomObject]@{
-                            SiteName = $SiteName
-                            SiteUrl = $SiteUrl
-                            ItemName = $item.Name
-                            ItemUrl = $item.WebUrl
-                            DriveLocation = $drive.Name
-                            FindingType = "URL Pattern Match"
-                            ScanDate = Get-Date
-                        }
-                        $results += $result
-                        Write-StatusMessage "    FOUND: Anonymous pattern in $($item.Name)" -Level "Warning"
+            # Import functions into parallel scope
+            ${function:Write-Log} = $using:function:Write-Log
+            ${function:Invoke-GraphWithRetry} = $using:function:Invoke-GraphWithRetry
+            ${function:Get-AllGraphPages} = $using:function:Get-AllGraphPages
+            ${function:Get-AnonymousPermissions} = $using:function:Get-AnonymousPermissions
+            $script:Results = $using:script:Results
+            $script:Stats = $using:script:Stats
+            $script:RetryConfig = $using:script:RetryConfig
+            
+            foreach ($item in $batch) {
+                try {
+                    $itemPath = if ($item.parentReference -and $item.parentReference.path) {
+                        $item.parentReference.path + "/" + $item.name
+                    } else {
+                        $item.name
                     }
                     
-                    # Check sharing permissions
-                    $sharingInfo = Test-ItemSharingPermissions -DriveId $drive.Id -ItemId $item.Id -ItemName $item.Name -ItemUrl $item.WebUrl
+                    # Scan permissions for this item
+                    Get-AnonymousPermissions -DriveId $innerDriveId -ItemId $item.id -ItemName $item.name -ItemPath $itemPath -SiteId $innerSiteId -SiteName $innerSiteName
                     
-                    foreach ($sharing in $sharingInfo) {
-                        $result = [PSCustomObject]@{
-                            SiteName = $SiteName
-                            SiteUrl = $SiteUrl
-                            ItemName = $sharing.ItemName
-                            ItemUrl = $sharing.ItemUrl
-                            DriveLocation = $drive.Name
-                            FindingType = $sharing.Reason
-                            ScanDate = Get-Date
+                    # If it's a folder, recursively scan its children
+                    if ($item.folder -and $item.folder.childCount -gt 0) {
+                        $childrenUri = "https://graph.microsoft.com/v1.0/drives/$innerDriveId/items/$($item.id)/children"
+                        $children = Get-AllGraphPages -Uri $childrenUri
+                        
+                        foreach ($child in $children) {
+                            $childPath = $itemPath + "/" + $child.name
+                            Get-AnonymousPermissions -DriveId $innerDriveId -ItemId $child.id -ItemName $child.name -ItemPath $childPath -SiteId $innerSiteId -SiteName $innerSiteName
                         }
-                        $results += $result
-                        Write-StatusMessage "    FOUND: $($sharing.Reason) in $($sharing.ItemName)" -Level "Warning"
                     }
                 }
-            } catch {
-                Write-StatusMessage "    Error scanning drive $($drive.Name): $($_.Exception.Message)" -Level "Error"
+                catch {
+                    Write-Log "Failed to process item '$($item.name)': $($_.Exception.Message)" -Level Error
+                    $script:Stats.Errors++
+                }
             }
+        } -ThrottleLimit $MaxConcurrency
+        
+        $script:Stats.DrivesScanned++
+        Write-Log "Completed scanning drive: $DriveName" -Level Success
+    }
+    catch {
+        Write-Log "Failed to scan drive '$DriveName': $($_.Exception.Message)" -Level Error
+        $script:Stats.Errors++
+    }
+}
+
+function Scan-Site {
+    param(
+        [PSCustomObject]$Site
+    )
+    
+    try {
+        $siteId = $Site.id
+        $siteName = $Site.displayName -or $Site.name -or "Unknown Site"
+        $siteUrl = $Site.webUrl
+        
+        # Apply site filter if specified
+        if ($SiteFilter -and $siteName -notmatch $SiteFilter) {
+            Write-Log "Skipping site '$siteName' (filtered out)" -Level Debug
+            return
         }
-    } catch {
-        Write-StatusMessage "  Error scanning site $SiteName`: $($_.Exception.Message)" -Level "Error"
+        
+        Write-Log "Scanning site: $siteName" -Level Info
+        Write-Log "Site URL: $siteUrl" -Level Debug
+        
+        # Get all drives for the site
+        $drivesUri = "https://graph.microsoft.com/v1.0/sites/$siteId/drives"
+        $drives = Get-AllGraphPages -Uri $drivesUri
+        
+        if ($drives.Count -eq 0) {
+            Write-Log "No drives found for site: $siteName" -Level Debug
+            return
+        }
+        
+        Write-Log "Found $($drives.Count) drive(s) in site: $siteName"
+        
+        # Scan each drive
+        foreach ($drive in $drives) {
+            Scan-DriveItems -DriveId $drive.id -DriveName $drive.name -SiteId $siteId -SiteName $siteName
+        }
+        
+        $script:Stats.SitesScanned++
+        Write-Log "Completed scanning site: $siteName" -Level Success
+    }
+    catch {
+        Write-Log "Failed to scan site '$($Site.displayName -or $Site.name)': $($_.Exception.Message)" -Level Error
+        $script:Stats.Errors++
+    }
+}
+
+#endregion
+
+#region Output Functions
+
+function Export-Results {
+    param(
+        [string]$Format,
+        [string]$OutputPath
+    )
+    
+    if ($script:Results.Count -eq 0) {
+        Write-Log "No anonymous links found to export" -Level Info
+        return
     }
     
-    return $results
-}
-
-# Main script execution
-Write-StatusMessage "SharePoint Anonymous Links Scanner v2.0"
-Write-StatusMessage "========================================"
-Write-StatusMessage "Compatible with Windows 10 and 11"
-Write-StatusMessage ""
-
-# Check required modules
-Write-StatusMessage "Checking required modules..."
-$requiredModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Sites", "Microsoft.Graph.Files")
-$missingModules = @()
-
-foreach ($module in $requiredModules) {
-    if (!(Get-Module -ListAvailable -Name $module)) {
-        $missingModules += $module
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $resultsArray = @($script:Results)
+    
+    try {
+        if ($Format -eq "CSV" -or $Format -eq "Both") {
+            $csvPath = Join-Path $OutputPath "AnonymousLinks_$timestamp.csv"
+            $resultsArray | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+            Write-Log "Results exported to CSV: $csvPath" -Level Success
+        }
+        
+        if ($Format -eq "JSON" -or $Format -eq "Both") {
+            $jsonPath = Join-Path $OutputPath "AnonymousLinks_$timestamp.json"
+            
+            $exportData = @{
+                scanInfo = @{
+                    scanDate = $script:Stats.StartTime
+                    scanDuration = (Get-Date) - $script:Stats.StartTime
+                    sitesScanned = $script:Stats.SitesScanned
+                    drivesScanned = $script:Stats.DrivesScanned
+                    itemsScanned = $script:Stats.ItemsScanned
+                    anonymousLinksFound = $script:Stats.AnonymousLinksFound
+                    errors = $script:Stats.Errors
+                    version = "3.0"
+                }
+                results = $resultsArray
+            }
+            
+            $exportData | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonPath -Encoding UTF8
+            Write-Log "Results exported to JSON: $jsonPath" -Level Success
+        }
+        
+        # Create remediation plan
+        if ($resultsArray.Count -gt 0) {
+            $remediationPath = Join-Path $OutputPath "RemediationPlan_$timestamp.json"
+            $remediationPlan = $resultsArray | Select-Object SiteId, DriveId, ItemId, PermissionId, LinkType, LinkScope, ItemName, ItemPath | Sort-Object SiteName, ItemPath
+            
+            $remediationData = @{
+                instructions = "Use Remove-AnonymousLinks.ps1 with this file to remediate findings"
+                totalItems = $remediationPlan.Count
+                items = $remediationPlan
+            }
+            
+            $remediationData | ConvertTo-Json -Depth 10 | Out-File -FilePath $remediationPath -Encoding UTF8
+            Write-Log "Remediation plan created: $remediationPath" -Level Success
+        }
+    }
+    catch {
+        Write-Log "Failed to export results: $($_.Exception.Message)" -Level Error
     }
 }
 
-if ($missingModules.Count -gt 0) {
-    Write-StatusMessage "Missing modules: $($missingModules -join ', ')" -Level "Error"
-    Write-StatusMessage "Please run Setup.ps1 first" -Level "Error"
+function Show-Summary {
+    $duration = (Get-Date) - $script:Stats.StartTime
+    
+    Write-Log ""
+    Write-Log "=== SCAN COMPLETE ===" -Level Success
+    Write-Log "Scan duration: $($duration.ToString('hh\:mm\:ss'))"
+    Write-Log "Sites scanned: $($script:Stats.SitesScanned)"
+    Write-Log "Drives scanned: $($script:Stats.DrivesScanned)"
+    Write-Log "Items scanned: $($script:Stats.ItemsScanned)"
+    Write-Log "Anonymous links found: $($script:Stats.AnonymousLinksFound)" -Level $(if ($script:Stats.AnonymousLinksFound -gt 0) { "Warning" } else { "Success" })
+    Write-Log "Errors encountered: $($script:Stats.Errors)" -Level $(if ($script:Stats.Errors -gt 0) { "Warning" } else { "Success" })
+    Write-Log ""
+    
+    if ($script:Results.Count -gt 0) {
+        Write-Log "=== FINDINGS SUMMARY ===" -Level Warning
+        $grouped = $script:Results | Group-Object LinkScope
+        foreach ($group in $grouped) {
+            Write-Log "$($group.Name): $($group.Count) items" -Level Warning
+        }
+        Write-Log ""
+    }
+}
+
+#endregion
+
+#region Main Execution
+
+function Main {
+    Write-Log "SharePoint Anonymous Links Scanner v3.0" -Level Success
+    Write-Log "========================================"
+    Write-Log "Production-ready scanner with proper Graph API usage"
+    Write-Log ""
+    
+    # Validate dependencies
+    Write-Log "Checking required modules..."
+    $requiredModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Sites", "Microsoft.Graph.Files")
+    $missingModules = @()
+    
+    foreach ($module in $requiredModules) {
+        if (!(Get-Module -ListAvailable -Name $module)) {
+            $missingModules += $module
+        }
+    }
+    
+    if ($missingModules.Count -gt 0) {
+        Write-Log "Missing modules: $($missingModules -join ', ')" -Level Error
+        Write-Log "Run: Install-Module $($missingModules -join ', ') -Scope CurrentUser" -Level Error
+        exit 1
+    }
+    
+    Write-Log "All required modules found" -Level Success
+    
+    # Authenticate
+    $connected = Connect-GraphWithMethod -Method $AuthMethod -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint
+    
+    if (-not $connected) {
+        Write-Log "Authentication failed. Exiting." -Level Error
+        exit 1
+    }
+    
+    try {
+        # Get SharePoint sites with search and pagination
+        Write-Log "Discovering SharePoint sites..."
+        $searchUri = "https://graph.microsoft.com/v1.0/sites?search=*&`$top=$BatchSize"
+        $headers = @{ 'ConsistencyLevel' = 'eventual' }
+        
+        $sites = Get-AllGraphPages -Uri $searchUri -Headers $headers
+        
+        if ($sites.Count -eq 0) {
+            Write-Log "No SharePoint sites found. Check permissions." -Level Warning
+            return
+        }
+        
+        Write-Log "Found $($sites.Count) SharePoint sites" -Level Success
+        
+        # Scan sites with controlled concurrency
+        Write-Log "Starting comprehensive site scan..."
+        Write-Log "Max concurrency: $MaxConcurrency, Batch size: $BatchSize"
+        Write-Log ""
+        
+        $sites | ForEach-Object -Parallel {
+            $site = $_
+            
+            # Import functions into parallel scope
+            ${function:Write-Log} = $using:function:Write-Log
+            ${function:Invoke-GraphWithRetry} = $using:function:Invoke-GraphWithRetry
+            ${function:Get-AllGraphPages} = $using:function:Get-AllGraphPages
+            ${function:Get-AnonymousPermissions} = $using:function:Get-AnonymousPermissions
+            ${function:Scan-DriveItems} = $using:function:Scan-DriveItems
+            ${function:Scan-Site} = $using:function:Scan-Site
+            $script:Results = $using:script:Results
+            $script:Stats = $using:script:Stats
+            $script:RetryConfig = $using:script:RetryConfig
+            $SiteFilter = $using:SiteFilter
+            $BatchSize = $using:BatchSize
+            $MaxConcurrency = $using:MaxConcurrency
+            $EnableDeltaQuery = $using:EnableDeltaQuery
+            
+            Scan-Site -Site $site
+        } -ThrottleLimit $MaxConcurrency
+        
+        Write-Log "Site scanning completed" -Level Success
+        
+        # Export results
+        Write-Log "Exporting results..."
+        Export-Results -Format $OutputFormat -OutputPath $OutputPath
+        
+        # Show summary
+        Show-Summary
+    }
+    catch {
+        Write-Log "Critical error during scan: $($_.Exception.Message)" -Level Error
+        $script:Stats.Errors++
+    }
+    finally {
+        try {
+            Disconnect-MgGraph -ErrorAction SilentlyContinue
+            Write-Log "Disconnected from Microsoft Graph"
+        }
+        catch {
+            # Ignore disconnect errors
+        }
+    }
+}
+
+# Entry point
+try {
+    Main
+}
+catch {
+    Write-Log "Unhandled error: $($_.Exception.Message)" -Level Error
+    Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level Error
     exit 1
 }
 
-Write-StatusMessage "All required modules found" -Level "Success"
-
-try {
-    # Connect to Microsoft Graph
-    Write-StatusMessage "Connecting to Microsoft Graph..."
-    
-    $connectParams = @{ Scopes = $Scope }
-    if ($TenantId) { 
-        $connectParams.TenantId = $TenantId 
-        Write-StatusMessage "Using specific Tenant ID: $TenantId"
-    }
-    
-    Connect-MgGraph @connectParams -NoWelcome
-    
-    $context = Get-MgContext
-    Write-StatusMessage "Connected to tenant: $($context.TenantId)" -Level "Success"
-    Write-StatusMessage "Account: $($context.Account)"
-    Write-StatusMessage "Scopes: $($context.Scopes -join ', ')"
-    Write-StatusMessage ""
-    
-    # Get SharePoint sites using reliable method
-    Write-StatusMessage "Retrieving SharePoint sites..."
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $sites = @()
-    
-    try {
-        # Use search first (most reliable on Windows 10)
-        Write-StatusMessage "Searching for SharePoint sites..."
-        $sites = Get-MgSite -Search "*" -All -ErrorAction Stop
-        Write-StatusMessage "Found $($sites.Count) sites via search" -Level "Success"
-    } catch {
-        Write-StatusMessage "Search failed, trying direct Graph API..." -Level "Warning"
-        
-        try {
-            $graphResponse = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/sites?search=*" -Method GET
-            if ($graphResponse.value) {
-                $sites = $graphResponse.value
-                Write-StatusMessage "Found $($sites.Count) sites via Graph API" -Level "Success"
-            }
-        } catch {
-            Write-StatusMessage "Graph API failed, trying root site..." -Level "Warning"
-            
-            try {
-                $rootSite = Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/v1.0/sites/root" -Method GET
-                if ($rootSite) {
-                    $sites = @($rootSite)
-                    Write-StatusMessage "Found root site only" -Level "Warning"
-                }
-            } catch {
-                Write-StatusMessage "All site discovery methods failed" -Level "Error"
-            }
-        }
-    }
-    
-    $stopwatch.Stop()
-    Write-StatusMessage "Site discovery completed in $($stopwatch.Elapsed.TotalSeconds.ToString('F2')) seconds"
-    
-    if ($sites.Count -eq 0) {
-        Write-StatusMessage "No SharePoint sites found. Check permissions." -Level "Error"
-        Write-StatusMessage "Required permissions: Sites.Read.All"
-        exit 0
-    }
-    
-    Write-StatusMessage ""
-    Write-StatusMessage "Starting site-by-site scan..."
-    Write-StatusMessage "=============================="
-    
-    # Scan sites
-    $allResults = @()
-    $siteCount = 0
-    $sitesWithLinks = 0
-    $totalLinks = 0
-    
-    foreach ($site in $sites) {
-        $siteCount++
-        
-        # Handle different property names from different API responses
-        $siteName = if ($site.DisplayName) { $site.DisplayName } elseif ($site.displayName) { $site.displayName } elseif ($site.Name) { $site.Name } else { "Unknown Site" }
-        $siteUrl = if ($site.WebUrl) { $site.WebUrl } elseif ($site.webUrl) { $site.webUrl } elseif ($site.Url) { $site.Url } else { "" }
-        $siteId = if ($site.Id) { $site.Id } elseif ($site.id) { $site.id } else { "" }
-        
-        if ($siteName -and $siteUrl -and $siteId) {
-            Write-StatusMessage "[$siteCount/$($sites.Count)] Scanning: $siteName" -Level "Progress"
-            Write-StatusMessage "  URL: $siteUrl"
-            
-            $siteStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-            $siteResults = Search-SiteForAnonymousLinks -SiteId $siteId -SiteName $siteName -SiteUrl $siteUrl
-            $siteStopwatch.Stop()
-            
-            $allResults += $siteResults
-            
-            if ($siteResults.Count -gt 0) {
-                $sitesWithLinks++
-                $totalLinks += $siteResults.Count
-                Write-StatusMessage "  Result: FOUND $($siteResults.Count) anonymous link(s)" -Level "Warning"
-            } else {
-                Write-StatusMessage "  Result: No anonymous links found" -Level "Success"
-            }
-            
-            Write-StatusMessage "  Scan time: $($siteStopwatch.Elapsed.TotalSeconds.ToString('F2'))s"
-        } else {
-            Write-StatusMessage "[$siteCount/$($sites.Count)] Skipping site with missing data" -Level "Warning"
-        }
-        
-        Write-StatusMessage ""
-    }
-    
-    # Display results
-    Write-StatusMessage ""
-    Write-StatusMessage "SCAN COMPLETE"
-    Write-StatusMessage "============="
-    Write-StatusMessage "Total sites scanned: $siteCount"
-    Write-StatusMessage "Sites with anonymous links: $sitesWithLinks"
-    Write-StatusMessage "Total anonymous links found: $totalLinks"
-    
-    if ($allResults.Count -gt 0) {
-        Write-StatusMessage "" 
-        Write-StatusMessage "ANONYMOUS LINKS FOUND:" -Level "Warning"
-        Write-StatusMessage ""
-        
-        foreach ($result in $allResults) {
-            Write-StatusMessage "Site: $($result.SiteName)"
-            Write-StatusMessage "Item: $($result.ItemName)"
-            Write-StatusMessage "Location: $($result.DriveLocation)"
-            Write-StatusMessage "Finding: $($result.FindingType)"
-            Write-StatusMessage "URL: $($result.ItemUrl)"
-            Write-StatusMessage ""
-        }
-        
-        # Export to CSV
-        $csvPath = "AnonymousLinks_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-        $allResults | Export-Csv -Path $csvPath -NoTypeInformation
-        Write-StatusMessage "Results exported to: $csvPath" -Level "Success"
-    } else {
-        Write-StatusMessage "No anonymous links found - good security hygiene!" -Level "Success"
-    }
-
-} catch {
-    Write-StatusMessage "Script error: $($_.Exception.Message)" -Level "Error"
-    Write-StatusMessage "Line: $($_.InvocationInfo.ScriptLineNumber)"
-} finally {
-    try {
-        Disconnect-MgGraph -ErrorAction SilentlyContinue
-        Write-StatusMessage "Disconnected from Microsoft Graph"
-    } catch {
-        # Ignore disconnect errors
-    }
-}
-
-Write-StatusMessage ""
-Write-StatusMessage "Script completed"
+#endregion

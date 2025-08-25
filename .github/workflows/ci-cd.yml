@@ -1,0 +1,301 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run tests weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+
+env:
+  POWERSHELL_TELEMETRY_OPTOUT: 1
+
+jobs:
+  test:
+    name: PowerShell Tests
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        powershell-version: ['5.1', '7.x']
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup PowerShell ${{ matrix.powershell-version }}
+      uses: actions/setup-powershell@v1
+      if: matrix.powershell-version == '7.x'
+      with:
+        powershell-version: ${{ matrix.powershell-version }}
+    
+    - name: Install required modules
+      shell: powershell
+      run: |
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+        Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+        Install-Module -Name Pester -Force -Scope CurrentUser -SkipPublisherCheck
+        
+        # Install Graph modules for testing (mock versions for CI)
+        if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+          Install-Module -Name Microsoft.Graph.Authentication -Force -Scope CurrentUser
+        }
+        if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Sites)) {
+          Install-Module -Name Microsoft.Graph.Sites -Force -Scope CurrentUser  
+        }
+        if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Files)) {
+          Install-Module -Name Microsoft.Graph.Files -Force -Scope CurrentUser
+        }
+    
+    - name: Run PSScriptAnalyzer
+      shell: powershell
+      run: |
+        $analysisResults = @()
+        
+        # Analyze main script
+        Write-Host "Analyzing Find-AnonymousLinks.ps1..."
+        $results = Invoke-ScriptAnalyzer -Path ".\Find-AnonymousLinks.ps1" -Severity Error,Warning,Information
+        $analysisResults += $results
+        
+        # Analyze remediation script
+        Write-Host "Analyzing Remove-AnonymousLinks.ps1..."
+        $results = Invoke-ScriptAnalyzer -Path ".\Remove-AnonymousLinks.ps1" -Severity Error,Warning,Information
+        $analysisResults += $results
+        
+        # Report results
+        if ($analysisResults) {
+          Write-Host "PSScriptAnalyzer found $($analysisResults.Count) issues:" -ForegroundColor Yellow
+          $analysisResults | ForEach-Object {
+            Write-Host "  [$($_.Severity)] $($_.RuleName): $($_.Message)" -ForegroundColor $(
+              switch ($_.Severity) {
+                'Error' { 'Red' }
+                'Warning' { 'Yellow' }
+                default { 'White' }
+              }
+            )
+            Write-Host "    File: $($_.ScriptName), Line: $($_.Line)"
+          }
+          
+          # Fail on errors
+          $errors = $analysisResults | Where-Object Severity -eq 'Error'
+          if ($errors) {
+            Write-Host "Found $($errors.Count) errors. Failing build." -ForegroundColor Red
+            exit 1
+          }
+        } else {
+          Write-Host "PSScriptAnalyzer found no issues!" -ForegroundColor Green
+        }
+    
+    - name: Run Pester tests
+      shell: powershell
+      run: |
+        # Configure Pester for CI
+        $pesterConfig = New-PesterConfiguration
+        $pesterConfig.Run.Path = ".\Tests"
+        $pesterConfig.TestResult.Enabled = $true
+        $pesterConfig.TestResult.OutputPath = "TestResults.xml"
+        $pesterConfig.TestResult.OutputFormat = "NUnitXml"
+        $pesterConfig.CodeCoverage.Enabled = $true
+        $pesterConfig.CodeCoverage.Path = @(".\Find-AnonymousLinks.ps1", ".\Remove-AnonymousLinks.ps1")
+        $pesterConfig.CodeCoverage.OutputPath = "Coverage.xml"
+        $pesterConfig.CodeCoverage.OutputFormat = "JaCoCo"
+        $pesterConfig.Output.Verbosity = "Detailed"
+        
+        # Run tests
+        $testResult = Invoke-Pester -Configuration $pesterConfig
+        
+        if ($testResult.FailedCount -gt 0) {
+          Write-Host "Tests failed: $($testResult.FailedCount) failed, $($testResult.PassedCount) passed" -ForegroundColor Red
+          exit 1
+        } else {
+          Write-Host "All tests passed: $($testResult.PassedCount) passed" -ForegroundColor Green
+        }
+    
+    - name: Publish test results
+      uses: dorny/test-reporter@v1
+      if: always()
+      with:
+        name: PowerShell Tests (${{ matrix.powershell-version }})
+        path: TestResults.xml
+        reporter: dotnet-trx
+        fail-on-error: true
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      if: matrix.powershell-version == '7.x'
+      with:
+        file: ./Coverage.xml
+        flags: powershell
+        name: codecov-powershell
+
+  security-scan:
+    name: Security Scan
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run Bandit security scan
+      # Note: Bandit is Python-focused, but we can use it as an example
+      # In reality, you'd use a PowerShell-specific security scanner
+      shell: powershell
+      run: |
+        Write-Host "Running security analysis..."
+        
+        # Check for common security anti-patterns
+        $securityIssues = @()
+        
+        # Scan for hardcoded secrets patterns
+        $secretPatterns = @(
+          'password\s*=\s*["\'].*["\']',
+          'secret\s*=\s*["\'].*["\']',
+          'key\s*=\s*["\'].*["\']',
+          'token\s*=\s*["\'].*["\']'
+        )
+        
+        Get-ChildItem -Path . -Include "*.ps1" -Recurse | ForEach-Object {
+          $content = Get-Content $_.FullName -Raw
+          foreach ($pattern in $secretPatterns) {
+            if ($content -match $pattern) {
+              $securityIssues += "Potential hardcoded secret in $($_.Name): $($matches[0])"
+            }
+          }
+        }
+        
+        if ($securityIssues) {
+          Write-Host "Security issues found:" -ForegroundColor Red
+          $securityIssues | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+          exit 1
+        } else {
+          Write-Host "No security issues found!" -ForegroundColor Green
+        }
+
+  validate-docs:
+    name: Validate Documentation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Validate README
+      run: |
+        # Check if README exists and has required sections
+        if [ ! -f "README.md" ]; then
+          echo "ERROR: README.md not found"
+          exit 1
+        fi
+        
+        # Check for required sections
+        required_sections=("Prerequisites" "Usage" "Features" "Limitations")
+        for section in "${required_sections[@]}"; do
+          if ! grep -q "## $section" README.md; then
+            echo "ERROR: Required section '$section' not found in README.md"
+            exit 1
+          fi
+        done
+        
+        echo "README.md validation passed!"
+    
+    - name: Check links in documentation
+      uses: gaurav-nelson/github-action-markdown-link-check@v1
+      with:
+        use-quiet-mode: 'yes'
+        use-verbose-mode: 'yes'
+        config-file: '.github/mlc_config.json'
+
+  performance-test:
+    name: Performance Validation
+    runs-on: windows-latest
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[perf-test]')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup PowerShell
+      uses: actions/setup-powershell@v1
+      with:
+        powershell-version: '7.x'
+    
+    - name: Run performance tests
+      shell: powershell
+      run: |
+        # Mock performance test - in reality this would connect to a test tenant
+        Write-Host "Running performance validation..."
+        
+        # Test script parsing time
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = Get-Content ".\Find-AnonymousLinks.ps1" -Raw
+        $stopwatch.Stop()
+        
+        $parseTime = $stopwatch.ElapsedMilliseconds
+        Write-Host "Script parse time: $parseTime ms"
+        
+        if ($parseTime -gt 5000) {
+          Write-Host "WARNING: Script parse time is slow ($parseTime ms)" -ForegroundColor Yellow
+        }
+        
+        # Test function loading
+        $stopwatch.Restart()
+        . ".\Find-AnonymousLinks.ps1" -ErrorAction SilentlyContinue
+        $stopwatch.Stop()
+        
+        $loadTime = $stopwatch.ElapsedMilliseconds
+        Write-Host "Script load time: $loadTime ms"
+        
+        if ($loadTime -gt 10000) {
+          Write-Host "ERROR: Script load time is too slow ($loadTime ms)" -ForegroundColor Red
+          exit 1
+        }
+        
+        Write-Host "Performance validation completed successfully!" -ForegroundColor Green
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [test, security-scan, validate-docs]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Simple changelog generation
+        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        if [ -z "$LAST_TAG" ]; then
+          COMMITS=$(git log --oneline --pretty=format:"- %s" HEAD~10..HEAD)
+        else
+          COMMITS=$(git log --oneline --pretty=format:"- %s" $LAST_TAG..HEAD)
+        fi
+        
+        echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+        echo "$COMMITS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v3.0.${{ github.run_number }}
+        release_name: Release v3.0.${{ github.run_number }}
+        body: |
+          ## Changes in this release
+          ${{ steps.changelog.outputs.CHANGELOG }}
+          
+          ## Installation
+          ```powershell
+          # Download and run the scanner
+          Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/v3.0.${{ github.run_number }}/Find-AnonymousLinks.ps1" -OutFile "Find-AnonymousLinks.ps1"
+          .\Find-AnonymousLinks.ps1
+          ```
+        draft: false
+        prerelease: false

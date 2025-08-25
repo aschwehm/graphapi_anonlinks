@@ -1,0 +1,26 @@
+{
+  "ignorePatterns": [
+    {
+      "pattern": "^https://graph\\.microsoft\\.com"
+    },
+    {
+      "pattern": "^https://login\\.microsoftonline\\.com"
+    },
+    {
+      "pattern": "^https://docs\\.microsoft\\.com"
+    },
+    {
+      "pattern": "localhost"
+    }
+  ],
+  "timeout": "10s",
+  "retryOn429": true,
+  "retryCount": 3,
+  "fallbackHttpStatus": [
+    400,
+    401,
+    403,
+    404,
+    500
+  ]
+}
